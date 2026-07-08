@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from aiohttp_socks import ProxyConnector
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -28,7 +29,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 NEURAL_API_KEY = os.getenv("NEURAL_API_KEY")
 NEURAL_BASE_URL = os.getenv("NEURAL_BASE_URL", "https://openrouter.ai/api/v1")
 NEURAL_MODEL = os.getenv("NEURAL_MODEL", "meta-llama/llama-3.1-70b-instruct")
+NEURAL_MODEL = os.getenv("NEURAL_MODEL", "tencent/hy3:free")
 PROXY_URL = os.getenv("PROXY_URL", "")
+
+OPENROUTER_HEADERS = {
+    "HTTP-Referer": "https://offerflow.tech",
+    "X-Title": "OfferFlow Bot"
+}
 
 # Инициализация
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -36,7 +43,8 @@ dp = Dispatcher()
 
 client = AsyncOpenAI(
     api_key=NEURAL_API_KEY,
-    base_url=NEURAL_BASE_URL
+    base_url=NEURAL_BASE_URL,
+    default_headers=OPENROUTER_HEADERS
 )
 
 # ================= СИСТЕМНЫЕ ПРОМПТЫ ПО КАТЕГОРИЯМ =================
@@ -185,32 +193,78 @@ def format_math_response(text: str) -> str:
     return text
 
 
-async def call_neural_api(prompt_type: str, user_query: str, context: str = "") -> str:
+async def call_neural_api(prompt_type: str, user_query: str, context: str = "", max_retries: int = 3) -> str:
     """
-    Отправляет запрос в нейросеть с соответствующим системным промптом.
+    Отправляет запрос в нейросеть с безопасным парсингом ответа.
+    Поддерживает retry при rate limit (429).
     """
     system_prompt = PROMPTS.get(prompt_type, PROMPTS['consult'])
-
     full_context = f"Контекст диалога: {context}\n" if context else ""
-
-    try:
-        response = await client.chat.completions.create(
-            model=NEURAL_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{full_context}Вопрос пользователя: {user_query}"}
-            ],
-            temperature=0.7,
-            max_tokens=1500,
-            # Дополнительные параметры для стабильности
-            extra_body={
-                "repetition_penalty": 1.1
-            } if "openrouter" in NEURAL_BASE_URL else {}
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"API Error: {e}")
-        return f"⚠️ Ошибка связи с нейросетью: {type(e).__name__}\nПопробуйте позже или перефразируйте вопрос."
+    
+    user_message = f"{full_context}Вопрос пользователя: {user_query}"
+    
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model=NEURAL_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=0.7,
+                max_tokens=1500,
+                # Параметры для OpenRouter
+                extra_body={
+                    "repetition_penalty": 1.1
+                } if "openrouter" in NEURAL_BASE_URL else {}
+            )
+            
+            # 🔍 Безопасное извлечение контента
+            content = None
+            
+            # Вариант 1: Стандартный OpenAI формат
+            if response.choices:
+                choice = response.choices[0]
+                if hasattr(choice, 'message') and choice.message:
+                    content = getattr(choice.message, 'content', None)
+                elif hasattr(choice, 'delta') and choice.delta:
+                    content = getattr(choice.delta, 'content', None)
+                elif hasattr(choice, 'text'):
+                    content = choice.text
+            
+            # Вариант 2: Фоллбэк через model_dump()
+            if not content and hasattr(response, 'model_dump'):
+                raw = response.model_dump()
+                if raw.get('choices') and isinstance(raw['choices'], list):
+                    choice = raw['choices'][0]
+                    if isinstance(choice, dict):
+                        if choice.get('message') and isinstance(choice['message'], dict):
+                            content = choice['message'].get('content')
+                        elif 'text' in choice:
+                            content = choice['text']
+            
+            if content and content.strip():
+                return content.strip()
+            
+            # Если контент пустой — логируем и пробуем снова (если есть попытки)
+            logging.warning(f"⚠️ Пустой ответ от {NEURAL_MODEL}, попытка {attempt+1}/{max_retries}")
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # 🔁 Retry при rate limit (429)
+            if "429" in error_str or "rate limit" in error_str:
+                wait_time = 2 ** attempt  # Экспоненциальная задержка: 2s, 4s, 8s
+                logging.warning(f"⏳ Rate limit, жду {wait_time}s (попытка {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+                continue
+            
+            # Другие ошибки — возвращаем сразу
+            logging.error(f"API Error: {type(e).__name__}: {e}")
+            return f"⚠️ Ошибка связи с нейросетью: {type(e).__name__}\nПопробуйте позже или перефразируйте вопрос."
+    
+    # Если все попытки исчерпаны
+    return "⚠️ Не удалось получить ответ после нескольких попыток. Попробуйте позже."
 
 
 def create_main_keyboard() -> types.ReplyKeyboardMarkup:
@@ -448,18 +502,35 @@ async def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    # Если указан прокси — настраиваем сессию
+    # 🔥 Настройка прокси (если указан)
     if PROXY_URL:
-        from aiohttp_socks import ProxyConnector
-        connector = ProxyConnector.from_url(PROXY_URL)
-        bot.session = aiohttp.ClientSession(connector=connector)
-        logging.info(f"✅ Прокси настроен: {PROXY_URL}")
+        try:
+            # Создаём коннектор с прокси
+            connector = ProxyConnector.from_url(PROXY_URL)
+            
+            # Обновляем сессию бота
+            from aiogram.client.session.aiohttp import AiohttpSession
+            bot.session = AiohttpSession(
+                connector=connector,
+                timeout=ClientTimeout(total=120, connect=30, sock_read=60)
+            )
+            logging.info(f"✅ Прокси настроен: {PROXY_URL}")
+        except Exception as e:
+            logging.error(f"❌ Ошибка настройки прокси: {e}")
 
     logging.info("🚀 Запуск бота...")
-    print(f"✅ Бот запущен! (@{(await bot.get_me()).username})")
+    
+    try:
+        me = await bot.get_me()
+        print(f"✅ Бот запущен! (@{me.username})")
+    except Exception as e:
+        logging.error(f"⚠️ Не удалось получить info о боте: {e}")
+        print(f"⚠️ Бот запущен (с предупреждением)")
 
-    await dp.start_polling(bot)
-
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

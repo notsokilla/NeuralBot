@@ -65,3 +65,4 @@ Desktop.ini
 *.tmp
 *.bak
 *.old
+*.env
